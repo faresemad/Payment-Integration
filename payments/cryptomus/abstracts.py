@@ -5,7 +5,7 @@ Single Responsibility: Define contracts/interfaces
 
 from abc import ABC, abstractmethod
 
-from ..cryptomus.dto import PaymentRequest, PayoutRequest
+from apps.services.cryptomus.dto import PaymentRequest, PayoutRequest
 
 
 class SignatureGenerator(ABC):

@@ -7,8 +7,8 @@ import logging
 
 from django.conf import settings
 
-from ..cryptomus.dto import PaymentRequest, PayoutRequest
-from ..cryptomus.implementations import (
+from apps.services.cryptomus.dto import PaymentRequest, PayoutRequest
+from apps.services.cryptomus.implementations import (
     CryptomusApiClient,
     CryptomusPaymentProcessor,
     CryptomusPayoutProcessor,
@@ -81,6 +81,8 @@ class CryptomusService:
         return self._payout_processor.get_payout_status(payout_uuid)
 
     # Webhook operations
-    def verify_signature(self, request_body: bytes, provided_signature: str) -> bool:
-        """Verify webhook signature for security"""
-        return self._webhook_validator.validate_webhook(request_body, provided_signature)
+    def verify_signature(self, data: dict, provided_signature: str | None) -> bool:
+        if not provided_signature:
+            self.logger.warning("No signature provided.")
+            return False
+        return self._webhook_validator.validate_webhook(data, provided_signature)

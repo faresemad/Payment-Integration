@@ -11,7 +11,7 @@ import logging
 
 import requests
 
-from ..cryptomus.abstracts import (
+from apps.services.cryptomus.abstracts import (
     ApiClient,
     HttpClient,
     PaymentProcessor,
@@ -19,7 +19,7 @@ from ..cryptomus.abstracts import (
     SignatureGenerator,
     WebhookValidator,
 )
-from ..cryptomus.dto import PaymentRequest, PayoutRequest
+from apps.services.cryptomus.dto import PaymentRequest, PayoutRequest
 
 
 class CryptomusSignatureGenerator(SignatureGenerator):
@@ -38,13 +38,20 @@ class CryptomusSignatureGenerator(SignatureGenerator):
         self.logger.debug("Signature generated successfully")
         return signature
 
-    def verify_webhook_signature(self, data: bytes, signature: str) -> bool:
-        """Verify HMAC signature for webhooks"""
-        self.logger.info("Verifying webhook signature")
-        generated_signature = hmac.new(key=self.api_key.encode(), msg=data, digestmod=hashlib.sha256).hexdigest()
-        is_valid = hmac.compare_digest(generated_signature, signature)
-        self.logger.info(f"Signature verification result: {is_valid}")
-        return is_valid
+    def verify_webhook_signature(self, data: dict, signature: str | None) -> bool:
+        if not signature:
+            self.logger.warning("Missing signature for verification.")
+            return False
+
+        try:
+            payload_str = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+            base64_encoded = base64.b64encode(payload_str.encode("utf-8")).decode("utf-8")
+            combined = base64_encoded + self.api_key
+            generated_signature = hashlib.md5(combined.encode("utf-8")).hexdigest()
+            return hmac.compare_digest(generated_signature, signature)
+        except TypeError as e:
+            self.logger.error(f"JSON serialization error: {e}")
+            return False
 
 
 class RequestsHttpClient(HttpClient):
