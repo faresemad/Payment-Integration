@@ -8,7 +8,7 @@ This module provides a clean and reusable integration with the [CoinGate Cryptoc
 coingate/
 ├── dto.py                # Data Transfer Object (CreateOrderDTO)
 ├── abstract.py           # Abstract base class for payment gateways
-├── implementation.py     # CoinGate-specific implementation
+├── implementations.py     # CoinGate-specific implementation
 └── service.py            # Application-facing service to use the gateway
 ```
 
@@ -23,7 +23,7 @@ coingate/
 ### 1. Create a payment order
 
 ```python
-from payment.service import PaymentService
+from apps.services.coingate.service import PaymentService
 
 payment_service = PaymentService()
 response = payment_service.create_payment(order, "BTC")

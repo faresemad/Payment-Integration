@@ -1,11 +1,11 @@
 from abc import ABC, abstractmethod
 
-from apps.services.coingate.dto import CreateOrderDTO
+from apps.services.coingate.dto import CoinGatePayment
 
 
 class AbstractPaymentGateway(ABC):
     @abstractmethod
-    def create_order(self, order_data: CreateOrderDTO) -> dict:
+    def create_order(self, order_data: CoinGatePayment) -> dict:
         """Create a payment order with the given details."""
         pass
 

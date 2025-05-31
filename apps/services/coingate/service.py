@@ -1,14 +1,14 @@
 from apps.orders.models import Order
-from apps.services.coingate.dto import CreateOrderDTO
-from apps.services.coingate.implementation import CoinGateGateway
+from apps.services.coingate.dto import CoinGatePayment
+from apps.services.coingate.implementations import CoinGateService
 
 
 class PaymentService:
     def __init__(self):
-        self.gateway = CoinGateGateway()
+        self.gateway = CoinGateService()
 
     def create_payment(self, order: Order, cryptocurrency: str):
-        dto = CreateOrderDTO(
+        dto = CoinGatePayment(
             order_id=str(order.id),
             price_amount=float(order.total_price),
             price_currency="USD",
