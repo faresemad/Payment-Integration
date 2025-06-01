@@ -1,201 +1,162 @@
-"""
-Concrete Implementations
-Single Responsibility: Implement abstract classes for Stripe
-"""
-
-import hashlib
-import hmac
-import json
 import logging
-import time
 
 import stripe
+from django.conf import settings
 
-from apps.services.stripe.abstracts import (
-    ApiClient,
-    HttpClient,
-    InvoiceProcessor,
-    SignatureValidator,
-    WebhookValidator,
-)
-from apps.services.stripe.dto import InvoiceRequest
+from apps.order.models import Order
+from apps.services.orders import OrderService
+from apps.services.stripe.abstract import AbstractPaymentService
+from apps.services.stripe.dto import CheckoutSessionRequestDTO, CheckoutSessionResponseDTO, StripeTax, WebhookEventDTO
+from apps.services.stripe.exceptions import StripeServiceException
+
+logger = logging.getLogger(__name__)
+stripe.api_key = settings.STRIPE_SECRET_KEY
 
 
-class StripeSignatureValidator(SignatureValidator):
-    """Stripe signature validator implementation"""
-
-    def __init__(self):
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-
-    def verify_webhook_signature(self, payload: bytes, signature: str, endpoint_secret: str) -> bool:
-        """Verify Stripe webhook signature"""
-        self.logger.info("Verifying webhook signature")
-        
+class StripePaymentServiceImpl(AbstractPaymentService):
+    def get_or_create_tax_rate(self, dto: StripeTax) -> str:
         try:
-            # Parse signature header
-            elements = signature.split(',')
-            timestamp = None
-            signatures = []
-            
-            for element in elements:
-                key, value = element.split('=', 1)
-                if key == 't':
-                    timestamp = int(value)
-                elif key.startswith('v'):
-                    signatures.append(value)
-            
-            if not timestamp or not signatures:
-                self.logger.error("Invalid signature format")
-                return False
-            
-            # Check timestamp (reject if older than 5 minutes)
-            current_time = int(time.time())
-            if abs(current_time - timestamp) > 300:
-                self.logger.error("Timestamp too old")
-                return False
-            
-            # Generate expected signature
-            signed_payload = f"{timestamp}.{payload.decode('utf-8')}"
-            expected_signature = hmac.new(
-                endpoint_secret.encode('utf-8'),
-                signed_payload.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            
-            # Compare signatures
-            for signature in signatures:
-                if hmac.compare_digest(expected_signature, signature):
-                    self.logger.info("Signature verification successful")
-                    return True
-            
-            self.logger.warning("Signature verification failed")
-            return False
-            
+            tax_rates = stripe.TaxRate.list(limit=100)
+            for rate in tax_rates.data:
+                if rate.percentage == dto.percentage and rate.active:
+                    return rate.id
+            tax_rate = stripe.TaxRate.create(
+                display_name=dto.display_name,
+                description=dto.description,
+                jurisdiction=dto.jurisdiction,
+                percentage=dto.percentage,
+                inclusive=dto.inclusive,
+            )
+            return tax_rate.id
         except Exception as e:
-            self.logger.error(f"Signature verification error: {str(e)}")
-            return False
+            logger.exception(f"Error creating/retrieving tax rate: {e}")
+            return None
 
-
-class StripeHttpClient(HttpClient):
-    """HTTP client using stripe library"""
-
-    def __init__(self, api_key: str):
-        stripe.api_key = api_key
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-
-    def post(self, url: str, data: dict, headers: dict[str, str]) -> dict:
-        """Not used directly - Stripe SDK handles HTTP"""
-        raise NotImplementedError("Use Stripe SDK methods directly")
-
-    def get(self, url: str, headers: dict[str, str]) -> dict:
-        """Not used directly - Stripe SDK handles HTTP"""
-        raise NotImplementedError("Use Stripe SDK methods directly")
-
-
-class StripeApiClient(ApiClient):
-    """Stripe API client implementation"""
-
-    def __init__(self, api_key: str):
-        stripe.api_key = api_key
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-
-    def make_request(self, method: str, endpoint: str, data: dict | None = None) -> dict:
-        """Make API request to Stripe using SDK"""
-        self.logger.info(f"Making {method} request to: {endpoint}")
-        
+    def create_checkout_session(self, dto: CheckoutSessionRequestDTO) -> CheckoutSessionResponseDTO:
         try:
-            if method.upper() == "POST" and endpoint == "invoices":
-                return stripe.Invoice.create(**data)
-            elif method.upper() == "GET" and endpoint.startswith("invoices/"):
-                invoice_id = endpoint.split("/")[1]
-                return stripe.Invoice.retrieve(invoice_id)
-            elif method.upper() == "POST" and endpoint.endswith("/send"):
-                invoice_id = endpoint.split("/")[1]
-                invoice = stripe.Invoice.retrieve(invoice_id)
-                return invoice.send_invoice()
-            elif method.upper() == "POST" and endpoint.endswith("/finalize"):
-                invoice_id = endpoint.split("/")[1]
-                invoice = stripe.Invoice.retrieve(invoice_id)
-                return invoice.finalize_invoice()
+            line_items = []
+            for item in dto.line_items:
+                price_data = {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": item.name,
+                    },
+                    "unit_amount": item.price,
+                }
+
+                if item.description:
+                    price_data["product_data"]["description"] = item.description
+
+                if item.tax_behavior:
+                    price_data["tax_behavior"] = item.tax_behavior
+
+                if item.price_data:
+                    price_data = {**price_data, **item.price_data}
+
+                line_item = {
+                    "price_data": price_data,
+                    "quantity": item.quantity,
+                }
+
+                if item.tax_rates:
+                    line_item["tax_rates"] = item.tax_rates
+
+                line_items.append(line_item)
+
+            session_params = {
+                "payment_method_types": ["card"],
+                "line_items": line_items,
+                "mode": "payment",
+                "customer_email": dto.customer_email,
+                "metadata": {"order_id": dto.order_id},
+                "success_url": dto.success_url,
+                "cancel_url": dto.cancel_url,
+                "automatic_tax": {
+                    "enabled": dto.automatic_tax
+                },
+            }
+
+            session = stripe.checkout.Session.create(**session_params)
+            return CheckoutSessionResponseDTO(
+                session_id=session.id,
+                payment_url=session.url
+            )
+        except Exception as e:
+            raise StripeServiceException(f"Checkout creation failed: {str(e)}")
+
+    def handle_webhook_event(self, dto: WebhookEventDTO) -> bool:
+        try:
+            event = stripe.Webhook.construct_event(
+                dto.payload,
+                dto.signature,
+                settings.STRIPE_WEBHOOK_SECRET
+            )
+
+            event_handlers = {
+                "checkout.session.completed": self.__handle_checkout_session_completed(event),
+                "payment_intent.succeeded": self.__handle_payment_intent_succeeded(event),
+                "charge.succeeded": self.__handle_charge_succeeded(event),
+                "payment_intent.created": self.__handle_payment_intent_created(event),
+                "checkout.session.expired": self.__handle_checkout_session_expired(event),
+            }
+
+            handler = event_handlers.get(event["type"])
+            if handler:
+                handler(event)
             else:
-                raise ValueError(f"Unsupported endpoint: {endpoint}")
-                
-        except stripe.error.StripeError as e:
-            self.logger.error(f"Stripe API error: {str(e)}")
-            raise
+                logger.warning(f"Unhandled Stripe event type: {event['type']}")
 
-
-class StripeInvoiceProcessor(InvoiceProcessor):
-    """Stripe invoice processor implementation"""
-
-    def __init__(self, api_client: ApiClient):
-        self.api_client = api_client
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-
-    def create_invoice(self, request: InvoiceRequest) -> dict:
-        """Create invoice using Stripe API"""
-        self.logger.info(f"Creating invoice for customer: {request.customer_email}")
-        
-        try:
-            # First, create or get customer
-            customer = self._get_or_create_customer(request.customer_email)
-            
-            # Create invoice
-            invoice_data = request.to_dict()
-            invoice_data["customer"] = customer.id
-            
-            # Create invoice items first
-            for line_item in request.line_items:
-                stripe.InvoiceItem.create(
-                    customer=customer.id,
-                    **line_item.to_dict()
-                )
-            
-            # Create the invoice
-            return self.api_client.make_request("POST", "invoices", invoice_data)
-            
+            return True
         except Exception as e:
-            self.logger.error(f"Invoice creation failed: {str(e)}")
-            raise
+            raise StripeServiceException(f"Webhook processing failed: {str(e)}")
 
-    def get_invoice(self, invoice_id: str) -> dict:
-        """Get invoice details using Stripe API"""
-        self.logger.info(f"Retrieving invoice: {invoice_id}")
-        return self.api_client.make_request("GET", f"invoices/{invoice_id}")
+    def __handle_checkout_session_completed(self, event):
+        session = event["data"]["object"]
+        order_id = session["metadata"].get("order_id")
 
-    def send_invoice(self, invoice_id: str) -> dict:
-        """Send invoice to customer"""
-        self.logger.info(f"Sending invoice: {invoice_id}")
-        return self.api_client.make_request("POST", f"invoices/{invoice_id}/send")
+        if not order_id:
+            logger.error("Checkout session completed but order_id is missing.")
+            return
+        order = Order.objects.filter(id=order_id).first()
+        if not order:
+            logger.error(f"Order with ID {order_id} not found.")
+            return
+        order_service = OrderService()
+        order_service._handle_successful_payment(order)
+        order_service._handle_order_transaction(order)
+        order_service._create_chat(order)
 
-    def finalize_invoice(self, invoice_id: str) -> dict:
-        """Finalize invoice"""
-        self.logger.info(f"Finalizing invoice: {invoice_id}")
-        return self.api_client.make_request("POST", f"invoices/{invoice_id}/finalize")
+    def __handle_payment_intent_succeeded(self, event):
+        payment_intent = event["data"]["object"]
+        order_id = payment_intent.get("metadata", {}).get("order_id")
 
-    def _get_or_create_customer(self, email: str):
-        """Get existing customer or create new one"""
+        if not order_id:
+            logger.error("Payment intent succeeded but order_id is missing.")
+            return
+
+        logger.info(f"Payment received for Order {order_id}, marking as paid.")
+
+    def __handle_charge_succeeded(self, event):
+        charge = event["data"]["object"]
+        logger.info(f"Charge succeeded: Amount {charge['amount']}, Charge ID {charge['id']}.")
+
+    def __handle_payment_intent_created(self, event):
+        payment_intent = event["data"]["object"]
+        logger.info(f"Payment Intent created with ID {payment_intent['id']}.")
+
+    def __handle_checkout_session_expired(self, event):
+        session = event["data"]["object"]
+        order_id = session["metadata"].get("order_id")
+
+        if not order_id:
+            logger.error("Checkout session expired but order_id is missing.")
+            return
+
         try:
-            # Try to find existing customer
-            customers = stripe.Customer.list(email=email, limit=1)
-            if customers.data:
-                return customers.data[0]
-            
-            # Create new customer
-            return stripe.Customer.create(email=email)
-            
-        except stripe.error.StripeError as e:
-            self.logger.error(f"Customer creation/retrieval failed: {str(e)}")
-            raise
-
-
-class StripeWebhookValidator(WebhookValidator):
-    """Stripe webhook validator implementation"""
-
-    def __init__(self, signature_validator: SignatureValidator):
-        self.signature_validator = signature_validator
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-
-    def validate_webhook(self, payload: bytes, signature: str, endpoint_secret: str) -> bool:
-        """Validate webhook signature"""
-        return self.signature_validator.verify_webhook_signature(payload, signature, endpoint_secret)
+            order = Order.objects.get(id=order_id)
+            order.status = Order.OrderStatus.EXPIRED
+            order.cancel_order()
+            order.delete()
+            logger.info(f"Order {order_id} marked as expired.")
+        except Order.DoesNotExist:
+            logger.error(f"Order with ID {order_id} not found in database.")
