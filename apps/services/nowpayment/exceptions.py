@@ -1,0 +1,2 @@
+class NowPaymentsAPIError(Exception):
+    pass
